@@ -1,0 +1,10 @@
+{
+  "name": "novotergum-xzone-token",
+  "version": "1.0.0",
+  "scripts": {
+    "update-xzone-token": "node scripts/update-xzone-token.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
