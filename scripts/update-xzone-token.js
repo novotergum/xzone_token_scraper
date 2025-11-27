@@ -1,101 +1,173 @@
 // scripts/update-xzone-token.js
-// npm install playwright
+// Holt den aktuellen XZONE Bearer-Token aus dem Browser-Traffic
+// und schreibt ihn per Webhook in dein Apps-Script (XZONE_TOKEN).
 
 const { chromium } = require('playwright');
 
-async function main() {
-  const XZONE_EMAIL    = process.env.XZONE_EMAIL;
-  const XZONE_PASSWORD = process.env.XZONE_PASSWORD;
-  const XZONE_BOARD_URL = process.env.XZONE_BOARD_URL;
-  const WEBHOOK_URL = process.env.WEBHOOK_URL;
-  const TOKEN_UPDATE_SECRET = process.env.TOKEN_UPDATE_SECRET || 'abc123';
+const {
+  XZONE_EMAIL,
+  XZONE_PASSWORD,
+  XZONE_BOARD_URL,       // z.B. https://exportarts.zone/boards/...
+  WEBHOOK_URL,           // Apps-Script Webhook URL (Actions-env)
+  TOKEN_UPDATE_SECRET,   // Secret für Apps Script (Actions-env)
+  HEADLESS               // optional: "false" für sichtbaren Browser lokal
+} = process.env;
 
-  if (!XZONE_EMAIL || !XZONE_PASSWORD || !XZONE_BOARD_URL || !WEBHOOK_URL) {
+// --- Basic Checks ---------------------------------------------------------
+
+function assertEnv(name) {
+  if (!process.env[name]) {
+    console.error(`[ERROR] Umgebungsvariable ${name} fehlt.`);
+    process.exit(1);
+  }
+}
+
+assertEnv('XZONE_EMAIL');
+assertEnv('XZONE_PASSWORD');
+assertEnv('WEBHOOK_URL');
+
+const webhookUrl = WEBHOOK_URL;
+const webhookSecret = TOKEN_UPDATE_SECRET || 'abc123';
+
+// --- Helper: Token an Apps Script Webhook senden -------------------------
+
+async function sendTokenToWebhook(token) {
+  console.log('[INFO] Sende Token an Apps-Script-Webhook ...');
+
+  const res = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      token,
+      secret: webhookSecret
+    })
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
     throw new Error(
-      'Fehlende ENV Variablen. Benötigt: XZONE_EMAIL, XZONE_PASSWORD, XZONE_BOARD_URL, WEBHOOK_URL'
+      `[ERROR] Webhook-Request fehlgeschlagen: ${res.status} ${res.statusText} – Body: ${text}`
     );
   }
 
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  let json;
+  try {
+    json = await res.json();
+  } catch {
+    json = null;
+  }
+  console.log('[INFO] Webhook-Antwort:', json || '<kein JSON>');
+}
 
-  let capturedToken = null;
+// --- Hauptlogik ----------------------------------------------------------
 
-  // 1) Listener: fängt den Authorization-Header ab, sobald /social-media/... aufgerufen wird
-  page.on('request', (request) => {
-    const url = request.url();
-    if (url.includes('/social-media/')) {
-      const headers = request.headers();
-      const auth = headers['authorization'] || headers['Authorization'];
-      if (auth && auth.startsWith('Bearer ')) {
-        capturedToken = auth.substring('Bearer '.length);
-        console.log('[INFO] Bearer-Token abgefangen, Länge:', capturedToken.length);
+async function run() {
+  console.log('[INFO] Starte Chromium ...');
+  const browser = await chromium.launch({
+    headless: HEADLESS === 'false' ? false : true
+  });
+
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  let tokenFound = null;
+
+  // Request-Listener: schnappt sich den Authorization-Header der XZONE-API
+  page.on('request', async (request) => {
+    try {
+      const url = request.url();
+
+      // Nur Requests zur XZONE-API ansehen
+      if (!url.startsWith('https://exportarts-zone.nw.r.appspot.com/v1/boards/')) {
+        return;
       }
+
+      const headers = request.headers();
+      const authHeader = headers['authorization'] || headers['Authorization'];
+
+      if (!authHeader || !authHeader.startsWith('Bearer ')) return;
+
+      const token = authHeader.slice('Bearer '.length).trim();
+      if (!token || tokenFound) return;
+
+      tokenFound = token;
+      console.log('[INFO] Bearer-Token im Request gefunden (gekürzt):', token.substring(0, 20) + '...');
+
+      await sendTokenToWebhook(token);
+
+      console.log('[INFO] Token erfolgreich aktualisiert. Browser wird geschlossen.');
+      await browser.close();
+      process.exit(0);
+    } catch (err) {
+      console.error('[ERROR] Fehler im Request-Handler:', err);
     }
   });
 
-  try {
-    console.log('[INFO] Öffne Login-Seite...');
-    await page.goto('https://exportarts.zone/login', {
-      waitUntil: 'networkidle',
-      timeout: 120_000
-    });
+  // --- Login-Sequenz auf Auth0-Form --------------------------------------
 
-    // TODO: Falls Login-Feld-Selektoren abweichen, hier anpassen
-    await page.fill('input[type="email"]', XZONE_EMAIL);
-    await page.fill('input[type="password"]', XZONE_PASSWORD);
-    await page.click('button[type="submit"]');
+  console.log('[INFO] Öffne Login-Seite ...');
+  await page.goto('https://exportarts.zone/login', {
+    waitUntil: 'domcontentloaded',
+    timeout: 120_000
+  });
+  await page.waitForLoadState('networkidle', { timeout: 120_000 });
+  console.log('[INFO] URL nach goto():', page.url());
 
-    // Auf Redirect / Dashboard warten
-    await page.waitForLoadState('networkidle', { timeout: 120_000 });
+  // Auth0 leitet ggf. weiter, also kurz warten und aktuelle URL loggen
+  await page.waitForTimeout(3000);
+  console.log('[INFO] URL nach Redirect (falls vorhanden):', page.url());
 
-    console.log('[INFO] Öffne Board:', XZONE_BOARD_URL);
+  // Robuste Selektoren basierend auf deinem HTML-Snippet
+  const emailSelector =
+    '#username, input[name="username"], input[inputmode="email"], input[type="email"]';
+  const passwordSelector =
+    '#password, input[name="password"][type="password"], input[type="password"]';
+
+  console.log('[INFO] Warte auf E-Mail-Feld ...');
+  await page.waitForSelector(emailSelector, { timeout: 60_000 });
+
+  console.log('[INFO] Fülle Credentials ...');
+  await page.fill(emailSelector, XZONE_EMAIL);
+  await page.fill(passwordSelector, XZONE_PASSWORD);
+
+  // Submit-Button (laut HTML: button[type="submit"][name="action"][value="default"])
+  const submitSelector =
+    'button[type="submit"][name="action"][value="default"], button[type="submit"]';
+
+  console.log('[INFO] Sende Login ab ...');
+  await Promise.all([
+    page.waitForLoadState('networkidle', { timeout: 120_000 }),
+    page.click(submitSelector)
+  ]);
+
+  console.log('[INFO] Login ausgeführt, aktuelle URL:', page.url());
+
+  // Optional direkt auf ein bestimmtes Board springen
+  if (XZONE_BOARD_URL) {
+    console.log('[INFO] Navigiere zu Board:', XZONE_BOARD_URL);
     await page.goto(XZONE_BOARD_URL, {
       waitUntil: 'networkidle',
       timeout: 120_000
     });
+    console.log('[INFO] Board-URL geladen:', page.url());
+  }
 
-    // 2) Warten, bis mindestens ein /social-media/ Request gelaufen ist und Token abgegriffen wurde
-    for (let i = 0; i < 20 && !capturedToken; i++) {
-      await page.waitForTimeout(1000);
-    }
+  console.log('[INFO] Warte auf API-Requests (max. 30 Sekunden) ...');
+  await page.waitForTimeout(30_000);
 
-    if (!capturedToken) {
-      throw new Error('Kein Bearer-Token gefunden. Prüfe Board-URL, Login und Selektoren.');
-    }
-
-    console.log('[INFO] Schicke Token an Webhook...');
-
-    // 3) Token direkt aus dem Browser-Kontext an Apps Script Webhook senden
-    const result = await page.evaluate(
-      async (webhookUrl, token, secret) => {
-        const res = await fetch(webhookUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token, secret })
-        });
-        const text = await res.text();
-        return { status: res.status, body: text };
-      },
-      WEBHOOK_URL,
-      capturedToken,
-      TOKEN_UPDATE_SECRET
-    );
-
-    console.log('[INFO] Webhook-Response-Status:', result.status);
-    console.log('[INFO] Webhook-Response-Body:', result.body);
-
-    if (result.status < 200 || result.status >= 300) {
-      throw new Error('Webhook-Fehler: ' + result.body);
-    }
-
-    console.log('[SUCCESS] XZONE_TOKEN wurde via Webhook aktualisiert.');
-  } finally {
+  if (!tokenFound) {
+    console.error('[ERROR] Kein Token gefunden. Mögliche Ursachen:');
+    console.error('- Das Board/Dashboard hat keine /social-media/-Requests ausgelöst.');
+    console.error('- Login-Formular-Selektoren haben sich geändert.');
+    console.error('- App lädt langsamer als 30 Sekunden (Timeout anpassen).');
     await browser.close();
+    process.exit(1);
   }
 }
 
-main().catch((err) => {
-  console.error('[FATAL]', err);
+// --- Start ----------------------------------------------------------------
+
+run().catch((err) => {
+  console.error('[FATAL] Unbehandelter Fehler:', err);
   process.exit(1);
 });
