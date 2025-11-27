@@ -1,0 +1,35 @@
+name: Update XZONE Token
+
+on:
+  schedule:
+    # täglich um 03:00 UTC (anpassen, wenn du magst)
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  update-token:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Run Playwright token updater
+        run: |
+          npm run update-xzone-token
+        env:
+          XZONE_EMAIL: ${{ secrets.XZONE_EMAIL }}
+          XZONE_PASSWORD: ${{ secrets.XZONE_PASSWORD }}
+          XZONE_BOARD_URL: ${{ secrets.XZONE_BOARD_URL }}
+          WEBHOOK_URL: ${{ secrets.XZONE_WEBHOOK_URL }}
+          TOKEN_UPDATE_SECRET: ${{ secrets.XZONE_TOKEN_UPDATE_SECRET }}
