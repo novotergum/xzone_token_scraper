@@ -59,6 +59,17 @@ async function sendTokenToWebhook(token) {
   console.log('[INFO] Webhook-Antwort:', json || '<kein JSON>');
 }
 
+// --- Token-Promise, um Race-Condition zu vermeiden ------------------------
+
+let tokenFound = null;
+let tokenResolve;
+let tokenReject;
+
+const tokenPromise = new Promise((resolve, reject) => {
+  tokenResolve = resolve;
+  tokenReject = reject;
+});
+
 // --- Hauptlogik ----------------------------------------------------------
 
 async function run() {
@@ -69,8 +80,6 @@ async function run() {
 
   const context = await browser.newContext();
   const page = await context.newPage();
-
-  let tokenFound = null;
 
   // Request-Listener: schnappt sich den Authorization-Header der XZONE-API
   page.on('request', async (request) => {
@@ -93,11 +102,13 @@ async function run() {
       tokenFound = token;
       console.log('[INFO] Bearer-Token im Request gefunden (gekürzt):', token.substring(0, 20) + '...');
 
-      await sendTokenToWebhook(token);
-
-      console.log('[INFO] Token erfolgreich aktualisiert. Browser wird geschlossen.');
-      await browser.close();
-      process.exit(0);
+      // Token per Webhook schicken und Promise auflösen
+      try {
+        await sendTokenToWebhook(token);
+        tokenResolve(token);
+      } catch (err) {
+        tokenReject(err);
+      }
     } catch (err) {
       console.error('[ERROR] Fehler im Request-Handler:', err);
     }
@@ -152,17 +163,31 @@ async function run() {
     console.log('[INFO] Board-URL geladen:', page.url());
   }
 
-  console.log('[INFO] Warte auf API-Requests (max. 30 Sekunden) ...');
-  await page.waitForTimeout(30_000);
+  // Jetzt warten wir darauf, dass der Request-Listener den Token findet
+  console.log('[INFO] Warte auf API-Requests und Token (max. 30 Sekunden) ...');
 
-  if (!tokenFound) {
-    console.error('[ERROR] Kein Token gefunden. Mögliche Ursachen:');
-    console.error('- Das Board/Dashboard hat keine /social-media/-Requests ausgelöst.');
-    console.error('- Login-Formular-Selektoren haben sich geändert.');
-    console.error('- App lädt langsamer als 30 Sekunden (Timeout anpassen).');
+  // Timeout-Wrapper für das Token-Promise
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('Timeout: Kein Token innerhalb von 30s gefunden')), 30_000)
+  );
+
+  try {
+    await Promise.race([tokenPromise, timeoutPromise]);
+  } catch (err) {
+    console.error('[ERROR] Kein Token gefunden oder Fehler beim Webhook:', err.message || err);
     await browser.close();
     process.exit(1);
   }
+
+  if (!tokenFound) {
+    console.error('[ERROR] tokenFound ist leer, trotz gelöstem Promise.');
+    await browser.close();
+    process.exit(1);
+  }
+
+  console.log('[INFO] Token erfolgreich aktualisiert. Browser wird geschlossen.');
+  await browser.close();
+  process.exit(0);
 }
 
 // --- Start ----------------------------------------------------------------
