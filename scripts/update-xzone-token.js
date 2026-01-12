@@ -1,23 +1,28 @@
-// scripts/update-xzone-token.js
-// Holt den aktuellen XZONE Bearer-Token aus dem Browser-Traffic
-// und schreibt ihn per Webhook in dein Apps-Script (XZONE_TOKEN).
+/**
+ * Update XZONE Bearer Token
+ * - Loggt sich per Playwright bei exportarts.zone (Auth0) ein
+ * - Fängt den access_token aus /oauth/token RESPONSE ab
+ * - Sendet ihn per Webhook an Google Apps Script
+ */
 
 const { chromium } = require('playwright');
+
+/* ------------------------------------------------------------------ */
+/* ENV                                                                 */
+/* ------------------------------------------------------------------ */
 
 const {
   XZONE_EMAIL,
   XZONE_PASSWORD,
-  XZONE_BOARD_URL,       // z.B. https://exportarts.zone/boards/...
-  WEBHOOK_URL,           // Apps-Script Webhook URL (Actions-env)
-  TOKEN_UPDATE_SECRET,   // Secret für Apps Script (Actions-env)
-  HEADLESS               // optional: "false" für sichtbaren Browser lokal
+  XZONE_BOARD_URL,
+  WEBHOOK_URL,
+  TOKEN_UPDATE_SECRET,
+  HEADLESS
 } = process.env;
-
-// --- Basic Checks ---------------------------------------------------------
 
 function assertEnv(name) {
   if (!process.env[name]) {
-    console.error(`[ERROR] Umgebungsvariable ${name} fehlt.`);
+    console.error(`[FATAL] Umgebungsvariable ${name} fehlt`);
     process.exit(1);
   }
 }
@@ -25,41 +30,37 @@ function assertEnv(name) {
 assertEnv('XZONE_EMAIL');
 assertEnv('XZONE_PASSWORD');
 assertEnv('WEBHOOK_URL');
+assertEnv('TOKEN_UPDATE_SECRET');
 
-const webhookUrl = WEBHOOK_URL;
-const webhookSecret = TOKEN_UPDATE_SECRET || 'abc123';
-
-// --- Helper: Token an Apps Script Webhook senden -------------------------
+/* ------------------------------------------------------------------ */
+/* WEBHOOK                                                             */
+/* ------------------------------------------------------------------ */
 
 async function sendTokenToWebhook(token) {
-  console.log('[INFO] Sende Token an Apps-Script-Webhook ...');
+  console.log('[INFO] Sende Token an Apps-Script-Webhook …');
 
-  const res = await fetch(webhookUrl, {
+  const res = await fetch(WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       token,
-      secret: webhookSecret
+      secret: TOKEN_UPDATE_SECRET
     })
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(
-      `[ERROR] Webhook-Request fehlgeschlagen: ${res.status} ${res.statusText} – Body: ${text}`
+      `Webhook fehlgeschlagen: ${res.status} ${res.statusText} – ${text}`
     );
   }
 
-  let json;
-  try {
-    json = await res.json();
-  } catch {
-    json = null;
-  }
-  console.log('[INFO] Webhook-Antwort:', json || '<kein JSON>');
+  console.log('[INFO] Webhook erfolgreich');
 }
 
-// --- Token-Promise, um Race-Condition zu vermeiden ------------------------
+/* ------------------------------------------------------------------ */
+/* TOKEN PROMISE                                                       */
+/* ------------------------------------------------------------------ */
 
 let tokenFound = null;
 let tokenResolve;
@@ -70,10 +71,13 @@ const tokenPromise = new Promise((resolve, reject) => {
   tokenReject = reject;
 });
 
-// --- Hauptlogik ----------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* MAIN                                                                */
+/* ------------------------------------------------------------------ */
 
 async function run() {
-  console.log('[INFO] Starte Chromium ...');
+  console.log('[INFO] Starte Chromium …');
+
   const browser = await chromium.launch({
     headless: HEADLESS === 'false' ? false : true
   });
@@ -81,116 +85,119 @@ async function run() {
   const context = await browser.newContext();
   const page = await context.newPage();
 
-  // Request-Listener: schnappt sich den Authorization-Header der XZONE-API
-  page.on('request', async (request) => {
+  /* -------------------------------------------------------------- */
+  /* AUTH0 TOKEN RESPONSE LISTENER                                   */
+  /* -------------------------------------------------------------- */
+
+  page.on('response', async (response) => {
     try {
-      const url = request.url();
+      const url = response.url();
+      if (!url.includes('/oauth/token')) return;
+      if (!response.ok()) return;
+      if (tokenFound) return;
 
-      // Nur Requests zur XZONE-API ansehen
-      if (!url.startsWith('https://exportarts-zone.nw.r.appspot.com/v1/boards/')) {
-        return;
-      }
+      const json = await response.json().catch(() => null);
+      if (!json?.access_token) return;
 
-      const headers = request.headers();
-      const authHeader = headers['authorization'] || headers['Authorization'];
+      tokenFound = json.access_token;
 
-      if (!authHeader || !authHeader.startsWith('Bearer ')) return;
+      console.log(
+        '[INFO] Auth0 access_token gefunden:',
+        tokenFound.substring(0, 20) + '…'
+      );
 
-      const token = authHeader.slice('Bearer '.length).trim();
-      if (!token || tokenFound) return;
+      // Promise SOFORT auflösen
+      tokenResolve(tokenFound);
 
-      tokenFound = token;
-      console.log('[INFO] Bearer-Token im Request gefunden (gekürzt):', token.substring(0, 20) + '...');
+      // Webhook asynchron (kein Blocker)
+      sendTokenToWebhook(tokenFound).catch(err =>
+        console.error('[ERROR] Webhook:', err.message)
+      );
 
-      // Token per Webhook schicken und Promise auflösen
-      try {
-        await sendTokenToWebhook(token);
-        tokenResolve(token);
-      } catch (err) {
-        tokenReject(err);
-      }
     } catch (err) {
-      console.error('[ERROR] Fehler im Request-Handler:', err);
+      console.error('[ERROR] Response-Handler:', err);
     }
   });
 
-  // --- Login-Sequenz auf Auth0-Form --------------------------------------
+  /* -------------------------------------------------------------- */
+  /* LOGIN FLOW                                                      */
+  /* -------------------------------------------------------------- */
 
-  console.log('[INFO] Öffne Login-Seite ...');
+  console.log('[INFO] Öffne Login-Seite …');
+
   await page.goto('https://exportarts.zone/login', {
     waitUntil: 'domcontentloaded',
     timeout: 120_000
   });
+
   await page.waitForLoadState('networkidle', { timeout: 120_000 });
-  console.log('[INFO] URL nach goto():', page.url());
 
-  // Auth0 leitet ggf. weiter, also kurz warten und aktuelle URL loggen
-  await page.waitForTimeout(3000);
-  console.log('[INFO] URL nach Redirect (falls vorhanden):', page.url());
-
-  // Robuste Selektoren basierend auf deinem HTML-Snippet
   const emailSelector =
-    '#username, input[name="username"], input[inputmode="email"], input[type="email"]';
+    '#username, input[name="username"], input[type="email"]';
   const passwordSelector =
     '#password, input[name="password"][type="password"], input[type="password"]';
 
-  console.log('[INFO] Warte auf E-Mail-Feld ...');
   await page.waitForSelector(emailSelector, { timeout: 60_000 });
 
-  console.log('[INFO] Fülle Credentials ...');
+  console.log('[INFO] Fülle Login-Daten …');
+
   await page.fill(emailSelector, XZONE_EMAIL);
   await page.fill(passwordSelector, XZONE_PASSWORD);
 
-  // Submit-Button (laut HTML: button[type="submit"][name="action"][value="default"])
   const submitSelector =
     'button[type="submit"][name="action"][value="default"], button[type="submit"]';
 
-  console.log('[INFO] Sende Login ab ...');
+  console.log('[INFO] Sende Login ab …');
+
   await Promise.all([
     page.waitForLoadState('networkidle', { timeout: 120_000 }),
     page.click(submitSelector)
   ]);
 
-  console.log('[INFO] Login ausgeführt, aktuelle URL:', page.url());
+  console.log('[INFO] Login abgeschlossen:', page.url());
 
-  // Optional direkt auf ein bestimmtes Board springen
+  /* -------------------------------------------------------------- */
+  /* OPTIONAL: BOARD LADEN                                           */
+  /* -------------------------------------------------------------- */
+
   if (XZONE_BOARD_URL) {
-    console.log('[INFO] Navigiere zu Board:', XZONE_BOARD_URL);
+    console.log('[INFO] Lade Board:', XZONE_BOARD_URL);
+
     await page.goto(XZONE_BOARD_URL, {
       waitUntil: 'networkidle',
       timeout: 120_000
     });
-    console.log('[INFO] Board-URL geladen:', page.url());
   }
 
-  // Jetzt warten wir darauf, dass der Request-Listener den Token findet
-  console.log('[INFO] Warte auf API-Requests und Token (max. 30 Sekunden) ...');
+  /* -------------------------------------------------------------- */
+  /* WAIT FOR TOKEN                                                  */
+  /* -------------------------------------------------------------- */
 
-  // Timeout-Wrapper für das Token-Promise
+  console.log('[INFO] Warte auf Auth0 Token (max. 30s) …');
+
   const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('Timeout: Kein Token innerhalb von 30s gefunden')), 30_000)
+    setTimeout(
+      () => reject(new Error('Timeout: Kein Token innerhalb von 30s')),
+      30_000
+    )
   );
 
   try {
     await Promise.race([tokenPromise, timeoutPromise]);
   } catch (err) {
-    console.error('[ERROR] Kein Token gefunden oder Fehler beim Webhook:', err.message || err);
+    console.error('[FATAL]', err.message);
     await browser.close();
     process.exit(1);
   }
 
-  if (!tokenFound) {
-    console.error('[ERROR] tokenFound ist leer, trotz gelöstem Promise.');
-    await browser.close();
-    process.exit(1);
-  }
-
-  console.log('[INFO] Token erfolgreich aktualisiert. Browser wird geschlossen.');
+  console.log('[INFO] Token erfolgreich aktualisiert');
   await browser.close();
   process.exit(0);
 }
 
-// --- Start ----------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* START                                                              */
+/* ------------------------------------------------------------------ */
 
 run().catch((err) => {
   console.error('[FATAL] Unbehandelter Fehler:', err);
