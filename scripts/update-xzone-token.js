@@ -132,23 +132,35 @@ async function run() {
 
   await page.waitForLoadState('networkidle', { timeout: 120_000 });
 
+  // Auth0 Universal Login ist identifier-first (zwei Schritte):
+  //   Screen 1 /u/login/identifier: nur #username + "Fortfahren". Hier liegt ein
+  //     VERSTECKTES Decoy-Passwortfeld (class="hide", aria-hidden) -> nie befüllen.
+  //   Screen 2 /u/login/password: jetzt erst erscheint das sichtbare #password.
   const emailSelector =
     '#username, input[name="username"], input[type="email"]';
+  // Decoy ausschließen: echtes Feld hat id/name="password"; das Decoy hat beides leer.
   const passwordSelector =
-    '#password, input[name="password"][type="password"], input[type="password"]';
-
-  await page.waitForSelector(emailSelector, { timeout: 60_000 });
-
-  console.log('[INFO] Fülle Login-Daten …');
-
-  await page.fill(emailSelector, XZONE_EMAIL);
-  await page.fill(passwordSelector, XZONE_PASSWORD);
-
+    '#password, input[name="password"][type="password"]';
   const submitSelector =
     'button[type="submit"][name="action"][value="default"], button[type="submit"]';
 
-  console.log('[INFO] Sende Login ab …');
+  // --- Screen 1: E-Mail ---
+  await page.waitForSelector(emailSelector, { state: 'visible', timeout: 60_000 });
 
+  console.log('[INFO] Fülle E-Mail …');
+  await page.fill(emailSelector, XZONE_EMAIL);
+
+  await Promise.all([
+    page.waitForLoadState('networkidle', { timeout: 120_000 }),
+    page.click(submitSelector)
+  ]);
+
+  // --- Screen 2: Passwort (wartet aufs SICHTBARE Feld, nie aufs Decoy) ---
+  console.log('[INFO] Fülle Passwort …');
+  await page.waitForSelector(passwordSelector, { state: 'visible', timeout: 60_000 });
+  await page.fill(passwordSelector, XZONE_PASSWORD);
+
+  console.log('[INFO] Sende Login ab …');
   await Promise.all([
     page.waitForLoadState('networkidle', { timeout: 120_000 }),
     page.click(submitSelector)
